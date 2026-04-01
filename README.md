@@ -40,7 +40,6 @@ The core engine (Long-Polling) that listens to your Telegram messages and intera
 | `-f` | `--config` | Path to `.env` file (Default `/etc/nagios-telegram-bot/config.env`) | ❌ |
 | `-V` | `--version` | Show script version | ❌ |
 
-
 **Available Telegram Commands:**
 
 * 🖥️ `/hosts` - Show down or unreachable hosts (unacknowledged).
