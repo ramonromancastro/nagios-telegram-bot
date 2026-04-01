@@ -1,0 +1,45 @@
+# ==========================================
+# Archivos generados y compilados
+# ==========================================
+# Ignoramos toda la carpeta build/ porque contiene los archivos 
+# generados dinámicamente por configure.sh (.service, .env.build, config.mk)
+build/
+
+# Por si acaso algún archivo de compilación se escapa a la raíz
+*.build
+config.mk
+
+# ==========================================
+# Secretos y Entornos
+# ==========================================
+# NUNCA subir archivos con tokens de Telegram o contraseñas de Nagios
+*.env
+config.env
+.env
+
+# ==========================================
+# Archivos de estado y ejecución local
+# ==========================================
+# Si pruebas el bot en local, generará este archivo para recordar el último mensaje
+bot_offset.txt
+*.log
+
+# ==========================================
+# Archivos temporales de editores (Vim, Nano, etc.)
+# ==========================================
+*~
+*.swp
+*.bak
+*.tmp
+
+# ==========================================
+# Basura del Sistema Operativo
+# ==========================================
+.DS_Store
+Thumbs.db
+
+# ==========================================
+# Carpetas de IDEs (VSCode, IntelliJ, etc.)
+# ==========================================
+.vscode/
+.idea/

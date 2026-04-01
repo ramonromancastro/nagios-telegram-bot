@@ -1,0 +1,742 @@
+#!/bin/bash
+#
+# nagios-telegram-bot - Bot interactivo y notificador para Nagios Core
+# Copyright (c) 2026 Ramón Román Castro <ramonroancastro@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# Ensures the script doesn't mask pipeline errors
+set -o pipefail
+
+# ==========================================
+# 0. GLOBAL CONSTANTS
+# ==========================================
+VERSION="1.1.1"
+CURL_TIMEOUT=15
+LONG_POLL_TIMEOUT=30
+ITEMS_PER_MESSAGE=10
+CURL_EXEC="curl -s -k -m ${CURL_TIMEOUT}"
+DEBUG=0
+
+# ==========================================
+# 1. CORE FUNCTIONS (Logging & Checks)
+# ==========================================
+
+# Standardized logging function
+log_msg() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    local log_output="[$timestamp] [$level] - $message"
+
+    case "$level" in
+        ERROR|FATAL) echo -e "\e[31m$log_output\e[0m" >&2 ;; # Red stderr
+        WARN)        echo -e "\e[33m$log_output\e[0m" >&2 ;; # Yellow stderr
+        DEBUG)       [[ $DEBUG -eq 1 ]] && echo -e "$log_output" ;; # Stdout if debug
+        INFO|*)      echo -e "$log_output" ;; # Stdout normal
+    esac
+}
+
+# Dependency checker
+check_dependencies() {
+    local deps=("curl" "jq" "awk")
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            log_msg "FATAL" "Required dependency '$dep' is not installed. Aborting."
+            exit 1
+        fi
+    done
+}
+
+# ==========================================
+# 2. TELEGRAM API INTERACTION
+# ==========================================
+
+send_message() {
+    local text="$1"
+    local response
+    local ok err_code desc
+
+    log_msg "INFO" "Sending message via Telegram API to Chat ID: ${CHAT_ID}..."
+    
+    # Send request and capture response
+    if ! response=$($CURL_EXEC -X POST "${TELEGRAM_API}/sendMessage" \
+        --data-urlencode "chat_id=${CHAT_ID}" \
+        --data-urlencode "text=${text}" \
+        --data-urlencode "parse_mode=Markdown" 2>/dev/null); then
+        
+        log_msg "ERROR" "Telegram API unreachable (Network/Timeout)."
+        return 1
+    fi
+    
+    # Validate response is valid JSON
+    if ! echo "$response" | jq -e . >/dev/null 2>&1; then
+        echo "[ERROR] Invalid JSON response from Telegram: $response" >&2
+        return 1
+    fi
+
+    ok=$(echo "$response" | jq -r '.ok')
+    if [[ "$ok" != "true" ]]; then
+        err_code=$(echo "$response" | jq -r '.error_code')
+        desc=$(echo "$response" | jq -r '.description')
+        log_msg "ERROR" "Telegram API failed (Error $err_code): $desc"
+        return 1
+    else
+        log_msg "INFO" "Message successfully delivered to Telegram."
+        return 0
+    fi
+}
+
+is_authorized() {
+    local chat_id="$1"
+    if [[ ",${ALLOWED_CHAT_IDS}," == *",${chat_id},"* ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# ==========================================
+# 3. BOT COMMANDS & LOGIC
+# ==========================================
+
+show_help() {
+    local help_text="🤖 *Nagios Core Monitoring Bot*
+
+*Overview & Functionality:*
+This bot allows you to interact with Nagios Core to check your infrastructure's status in real-time. It intelligently filters out acknowledged (ACK) alerts or those derived from a downed host, preventing \"alert fatigue\". You will only see active incidents that require your attention.
+
+*Available Commands:*
+🖥️ /hosts - Show down or unreachable hosts.
+⚙️ /services - List critical or warning services.
+📊 /status - Display Nagios engine status.
+📈 /perf - Show latency and performance metrics.
+🔕 /ack\_host - Acknowledge a downed host (e.g., /ack\_host \"Host\" [optional comment]).
+🔕 /ack\_service - Acknowledge a failed service (e.g., /ack\_service \"Host\" \"Service\" [optional comment]).
+📢 /broadcast - Send a message to all bot administrators.
+🏓 /ping - Check bot availability.
+🛑 /shutdown - Terminate the bot process cleanly.
+ℹ️ /help - Show this information menu."
+
+    send_message "$help_text"
+}
+
+broadcast_message() {
+    local message="$1"
+    local sender_name="$2"
+    local original_chat_id="$CHAT_ID" 
+    local count=0
+    
+    local broadcast_text="📢 *Admin Broadcast*
+👤 *From:* \`${sender_name}\`
+💬 *Message:* _${message}_"
+
+    log_msg "INFO" "Sending broadcast message (excluding sender)..."
+    
+    IFS=',' read -ra ADM_CHATS <<< "$ALLOWED_CHAT_IDS"
+    for chat in "${ADM_CHATS[@]}"; do
+        if [[ -n "$chat" ]] && [[ "$chat" != "$original_chat_id" ]]; then
+            CHAT_ID="$chat" 
+            send_message "$broadcast_text"
+            ((count++))
+            sleep 1 
+        fi
+    done
+    
+    CHAT_ID="$original_chat_id"
+    if [[ "$count" -eq 0 ]]; then
+        send_message "⚠️ *Broadcast not sent.* (You are the only admin in the allowed list)."
+    else
+        send_message "✅ *Broadcast successfully sent to ${count} admin(s).*."
+    fi
+}
+
+get_hosts_down() {
+    log_msg "INFO" "Querying unacknowledged down hosts..."
+    local response
+    
+    if ! response=$(${CURL_EXEC} -u "${NAGIOS_USER}:${NAGIOS_PASS}" "${NAGIOS_URL}/cgi-bin/statusjson.cgi?query=hostlist&details=true&hoststatus=down%20unreachable%20pending"); then
+        send_message "❌ *Error:* Unable to reach Nagios API."
+        return 1
+    fi
+
+    local raw_data=$(echo "$response" | jq -r '
+        .data.hostlist | to_entries[]? | 
+        select(.value.problem_has_been_acknowledged == false) | 
+        "\(.key)\t\(.value.plugin_output)"
+    ' 2>/dev/null)
+    
+    if [[ -z "$raw_data" ]]; then
+        send_message "✅ All hosts are UP or already acknowledged (ACK)."
+        return 0
+    fi
+    
+    send_message "🚨 *Problematic Hosts (Unacknowledged):*"
+
+    local chunks_output=$(echo -e "${raw_data}" | awk -F'\t' -v items_per_page=${ITEMS_PER_MESSAGE} '
+    {
+        wrap_limit = 41
+        col1[NR] = $1; col2[NR] = $2
+    }
+    END {
+        dash = ""; for(d=1; d<=wrap_limit; d++) dash = dash "-"
+        header1 = sprintf("| %-*s |", wrap_limit, "Service")
+        header2 = sprintf("|-%s-|", dash)
+        
+        chunk = "```text\n" header1 "\n" header2 "\n"
+        total_line_count = 0; line_count = 0
+        
+        for (i = 1; i <= NR; i++) {
+            chunk_cmds = chunk_cmds sprintf("`/ack_host \"%s\" \"%s\"`\n", col1[i], col2[i])
+
+            len = length(col1[i])
+            if (len != 0) {
+                 for (pos = 1; pos <= len; pos += wrap_limit) {
+                     sub_err = substr(col1[i], pos, wrap_limit)
+                     chunk = chunk sprintf("| %-*s |\n", wrap_limit, sub_err)
+                 }
+            }
+
+            len = length(col2[i])
+            if (len != 0) {
+                for (pos = 1; pos <= len; pos += wrap_limit) {
+                    sub_err = substr(col2[i], pos, wrap_limit)
+                    chunk = chunk sprintf("| %-*s |\n", wrap_limit, sub_err)
+                }
+            }
+
+            chunk = chunk header2 "\n"
+            line_count++; total_line_count++
+            
+            if (line_count == items_per_page || i == NR) {
+                chunk = chunk "```"
+                print chunk
+                print "👇 Quick commands (Tap to copy):"
+                print chunk_cmds
+                chunk_cmds = ""
+                print "__CHUNK_BOUNDARY__"
+                
+                if (i != NR) {
+                    chunk = "```text\n" header1 "\n" header2 "\n"
+                    line_count = 0
+                }
+            }
+        }
+        
+        print "*Summary:* " total_line_count " problematic hosts found."
+        print "__CHUNK_BOUNDARY__"
+    }')
+
+    _send_chunks "$chunks_output"
+}
+
+get_services_critical() { 
+    log_msg "INFO" "Querying unacknowledged critical services..."
+    local hosts_response services_response unacked_down_hosts raw_data
+    
+    if ! hosts_response=$(${CURL_EXEC} -u "${NAGIOS_USER}:${NAGIOS_PASS}" "${NAGIOS_URL}/cgi-bin/statusjson.cgi?query=hostlist&details=true&hoststatus=down%20unreachable%20pending"); then
+        send_message "❌ *Error:* Unable to reach Nagios API."
+        return 1
+    fi
+    
+    unacked_down_hosts=$(echo "$hosts_response" | jq -c '[ .data.hostlist | to_entries[]? | select(.value.problem_has_been_acknowledged == false) | .key ]' 2>/dev/null)
+    [[ -z "$unacked_down_hosts" || "$unacked_down_hosts" == "null" ]] && unacked_down_hosts="[]"
+
+    services_response=$(${CURL_EXEC} -u "${NAGIOS_USER}:${NAGIOS_PASS}" "${NAGIOS_URL}/cgi-bin/statusjson.cgi?query=servicelist&details=true&servicestatus=warning%20critical%20unknown%20pending")
+    
+    raw_data=$(echo "$services_response" | jq -r --argjson bad_hosts "$unacked_down_hosts" '
+        .data.servicelist | to_entries[]? |
+        .key as $host | select($bad_hosts | index($host) | not) |
+        .value | to_entries[]? | select(.value.problem_has_been_acknowledged == false) |
+        "\($host)\t\(.key)\t\(.value.plugin_output)" 
+    ' 2>/dev/null)
+    
+    if [[ -z "$raw_data" ]]; then
+        send_message "✅ All services are OK or already acknowledged (ACK)."
+        return 0
+    fi
+    
+    send_message "🚨 *Problematic Services (Unacknowledged):*"
+
+    local chunks_output=$(echo -e "${raw_data}" | awk -F'\t' -v items_per_page=${ITEMS_PER_MESSAGE} '
+    {
+        wrap_limit = 41
+        col1[NR] = $1; col2[NR] = $2; col3[NR] = $3
+    }
+    END {
+        dash = ""; for(d=1; d<=wrap_limit; d++) dash = dash "-"
+        header1 = sprintf("| %-*s |", wrap_limit, "Service")
+        header2 = sprintf("|-%s-|", dash)
+        
+        chunk = "```text\n" header1 "\n" header2 "\n"
+        total_line_count = 0; line_count = 0
+        
+        for (i = 1; i <= NR; i++) {
+            chunk = chunk sprintf("| %-*s |\n", wrap_limit, col1[i])
+            chunk_cmds = chunk_cmds sprintf("`/ack_service \"%s\" \"%s\"`\n", col1[i], col2[i])
+
+            len = length(col1[i])
+            if (len != 0) {
+                 for (pos = 1; pos <= len; pos += wrap_limit) {
+                     sub_err = substr(col1[i], pos, wrap_limit)
+                     chunk = chunk sprintf("| %-*s |\n", wrap_limit, sub_err)
+                 }
+            }
+
+            len = length(col2[i])
+            if (len != 0) {
+                 for (pos = 1; pos <= len; pos += wrap_limit) {
+                     sub_err = substr(col2[i], pos, wrap_limit)
+                     chunk = chunk sprintf("| %-*s |\n", wrap_limit, sub_err)
+                 }
+            }
+
+            len = length(col3[i])
+            if (len != 0) {
+                for (pos = 1; pos <= len; pos += wrap_limit) {
+                    sub_err = substr(col3[i], pos, wrap_limit)
+                    chunk = chunk sprintf("| %-*s |\n", wrap_limit, sub_err)
+                }
+            }
+
+            chunk = chunk header2 "\n"
+            line_count++; total_line_count++
+            
+            if (line_count == items_per_page || i == NR) {
+                chunk = chunk "```"
+                print chunk
+                print "👇 Quick commands (Tap to copy):"
+                print chunk_cmds
+                chunk_cmds = ""
+                print "__CHUNK_BOUNDARY__"
+                
+                if (i != NR) {
+                    chunk = "```text\n" header1 "\n" header2 "\n"
+                    line_count = 0
+                }
+            }
+        }
+        print "*Summary:* " total_line_count " problematic services found."
+        print "__CHUNK_BOUNDARY__"
+    }')
+
+    _send_chunks "$chunks_output"
+}
+
+# Helper function to send chunked text
+_send_chunks() {
+    local data="$1"
+    local current_chunk=""
+    while IFS= read -r line; do
+        if [[ "$line" == "__CHUNK_BOUNDARY__" ]]; then
+            if [[ -n "$current_chunk" ]]; then
+                send_message "$current_chunk"
+                sleep 1 
+            fi
+            current_chunk=""
+        else
+            if [[ -z "$current_chunk" ]]; then
+                current_chunk="$line"
+            else
+                current_chunk="${current_chunk}"$'\n'"${line}"
+            fi
+        fi
+    done <<< "$data"
+}
+
+get_system_status() {
+    log_msg "INFO" "Querying Nagios system status..."
+    local response=$(${CURL_EXEC} -u "${NAGIOS_USER}:${NAGIOS_PASS}" "${NAGIOS_URL}/cgi-bin/statusjson.cgi?query=programstatus")
+    
+    if [[ -z "$response" ]] || ! echo "$response" | jq -e . >/dev/null 2>&1; then
+        send_message "❌ *Error:* Could not retrieve Nagios system status."
+        return 1
+    fi
+    
+    local version=$(echo "$response" | jq -r '.data.programstatus.version')
+    local pid=$(echo "$response" | jq -r '.data.programstatus.nagios_pid')
+    local start_ms=$(echo "$response" | jq -r '.data.programstatus.program_start')
+    
+    local start_sec=$((start_ms / 1000))
+    local start_date=$(date -d "@$start_sec" "+%Y-%m-%d %H:%M:%S")
+    
+    local notifications=$(echo "$response" | jq -r '.data.programstatus.enable_notifications')
+    local srv_checks=$(echo "$response" | jq -r '.data.programstatus.execute_service_checks')
+    local host_checks=$(echo "$response" | jq -r '.data.programstatus.execute_host_checks')
+    
+    local icon_notif="❌ Disabled"; [[ "$notifications" == "true" ]] && icon_notif="✅ Enabled"
+    local icon_srv="❌ Paused"; [[ "$srv_checks" == "true" ]] && icon_srv="✅ Running"
+    local icon_host="❌ Paused"; [[ "$host_checks" == "true" ]] && icon_host="✅ Running"
+
+    local status_msg="⚙️ *Nagios System Status* ⚙️
+
+*Core Version:* \`${version}\`
+*PID:* \`${pid}\`
+*Last Startup:* \`${start_date}\`
+
+*Main Engines:*
+🔔 *Notifications:* ${icon_notif}
+🖥️ *Host Checks:* ${icon_host}
+⚙️ *Service Checks:* ${icon_srv}"
+
+    send_message "$status_msg"
+}
+
+get_performance_data() {
+    log_msg "INFO" "Querying Nagios performance metrics..."
+    local response=$(${CURL_EXEC} -u "${NAGIOS_USER}:${NAGIOS_PASS}" "${NAGIOS_URL}/cgi-bin/statusjson.cgi?query=performancedata")
+    
+    if [[ -z "$response" ]] || ! echo "$response" | jq -e . >/dev/null 2>&1; then
+        send_message "❌ *Error:* Could not retrieve Nagios performance data."
+        return 1
+    fi
+    
+    local svc_exec_avg=$(echo "$response" | jq -r '.data.programstatus.service_checks.active.metrics.check_execution_time.average // "0"')
+    local svc_exec_max=$(echo "$response" | jq -r '.data.programstatus.service_checks.active.metrics.check_execution_time.max // "0"')
+    local svc_lat_avg=$(echo "$response" | jq -r '.data.programstatus.service_checks.active.metrics.check_latency.average // "0"')
+    
+    local host_exec_avg=$(echo "$response" | jq -r '.data.programstatus.host_checks.active.metrics.check_execution_time.average // "0"')
+    local host_exec_max=$(echo "$response" | jq -r '.data.programstatus.host_checks.active.metrics.check_execution_time.max // "0"')
+    local host_lat_avg=$(echo "$response" | jq -r '.data.programstatus.host_checks.active.metrics.check_latency.average // "0"')
+    
+    local checks_svc_5m=$(echo "$response" | jq -r '.data.programstatus.check_statistics.active_scheduled_service_checks["5min"] // "0"')
+    local checks_host_5m=$(echo "$response" | jq -r '.data.programstatus.check_statistics.active_scheduled_host_checks["5min"] // "0"')
+
+    local perf_msg="📈 *Nagios Performance* 📈
+
+*Service Metrics:*
+⏱️ *Avg Execution:* \`${svc_exec_avg}s\` (Max: \`${svc_exec_max}s\`)
+⏳ *Avg Latency:* \`${svc_lat_avg}s\`
+
+*Host Metrics:*
+⏱️ *Avg Execution:* \`${host_exec_avg}s\` (Max: \`${host_exec_max}s\`)
+⏳ *Avg Latency:* \`${host_lat_avg}s\`
+
+*Volume (Last 5 min):*
+🖥️ *Hosts checked:* \`${checks_host_5m}\`
+⚙️ *Services checked:* \`${checks_svc_5m}\`"
+
+    send_message "$perf_msg"
+}
+
+ack_service() {
+    local host="$1"
+    local service="$2"
+    local comment="$3"
+    
+    [[ -z "$comment" ]] && comment="Acknowledged via Telegram by ${FIRST_NAME}"
+
+    log_msg "INFO" "Initiating ACK process for service '$service' on host '$host'..."
+    local cookie_file="/tmp/nagios_cookie_$$.txt"
+
+    # STEP 1
+    local form_html=$(${CURL_EXEC} --get -c "$cookie_file" -u "${NAGIOS_USER}:${NAGIOS_PASS}" -d "cmd_typ=34" --data-urlencode "host=${host}" --data-urlencode "service=${service}" "${NAGIOS_URL}/cgi-bin/cmd.cgi")
+    local csrf_token=$(echo "$form_html" | grep -i "nagFormId" | sed -E "s/.*VALUE=['\"]([^'\"]+)['\"].*/\1/i" | head -n 1)
+
+    [[ -z "$csrf_token" ]] && log_msg "WARN" "Could not extract nagFormId for service. Command may fail."
+
+    # STEP 2
+    local response=$(${CURL_EXEC} -X POST -b "$cookie_file" -u "${NAGIOS_USER}:${NAGIOS_PASS}" \
+        -d "cmd_typ=34" -d "cmd_mod=2" \
+        --data-urlencode "host=${host}" --data-urlencode "service=${service}" \
+        -d "sticky_ack=on" -d "send_notification=on" -d "persistent=on" \
+        --data-urlencode "com_author=TelegramBot" --data-urlencode "com_data=${comment}" \
+        --data-urlencode "nagFormId=${csrf_token}" -d "btnSubmit=Commit" \
+        "${NAGIOS_URL}/cgi-bin/cmd.cgi" 2>/dev/null)
+
+    rm -f "$cookie_file"
+
+    if echo "$response" | grep -iq "successfully submitted"; then
+        for chat in "${ADM_CHATS[@]}"; do
+            CHAT_ID="$chat" 
+            send_message "✅ *Service Acknowledged (ACK)*
+🖥️ *Host:* \`${host}\`
+⚙️ *Service:* \`${service}\`
+👤 *By:* \`${FIRST_NAME}\`
+💬 *Comment:* _${comment}_"
+            ((count++))
+            sleep 1 
+        done
+        log_msg "INFO" "ACK successfully applied: $host -> $service"
+    else
+        local error_detail=$(echo "$response" | grep -oP '(?<=<p>Error: ).*(?=</p>)' || echo "Rejected by CSRF or Permissions")
+        send_message "❌ *Error applying ACK to \`${service}\`.*
+Details: ${error_detail}"
+        log_msg "ERROR" "Failed to apply ACK: $host -> $service. Details: $error_detail"
+    fi
+}
+
+ack_host() {
+    local host="$1"
+    local comment="$2"
+    
+    [[ -z "$comment" ]] && comment="Acknowledged via Telegram by ${FIRST_NAME}"
+
+    log_msg "INFO" "Initiating ACK process for host '$host'..."
+    local cookie_file="/tmp/nagios_cookie_$$.txt"
+
+    # STEP 1
+    local form_html=$(${CURL_EXEC} --get -c "$cookie_file" -u "${NAGIOS_USER}:${NAGIOS_PASS}" -d "cmd_typ=33" --data-urlencode "host=${host}" "${NAGIOS_URL}/cgi-bin/cmd.cgi")
+    local csrf_token=$(echo "$form_html" | grep -i "nagFormId" | sed -E "s/.*VALUE=['\"]([^'\"]+)['\"].*/\1/i" | head -n 1)
+
+    [[ -z "$csrf_token" ]] && log_msg "WARN" "Could not extract nagFormId for host. Command may fail."
+
+    # STEP 2
+    local response=$(${CURL_EXEC} -X POST -b "$cookie_file" -u "${NAGIOS_USER}:${NAGIOS_PASS}" \
+        -d "cmd_typ=33" -d "cmd_mod=2" \
+        --data-urlencode "host=${host}" \
+        -d "sticky_ack=on" -d "send_notification=on" -d "persistent=on" \
+        --data-urlencode "com_author=TelegramBot" --data-urlencode "com_data=${comment}" \
+        --data-urlencode "nagFormId=${csrf_token}" -d "btnSubmit=Commit" \
+        "${NAGIOS_URL}/cgi-bin/cmd.cgi" 2>/dev/null)
+
+    rm -f "$cookie_file"
+
+    if echo "$response" | grep -iq "successfully submitted"; then
+        for chat in "${ADM_CHATS[@]}"; do
+            CHAT_ID="$chat" 
+            send_message "✅ *Host Acknowledged (ACK)*
+🖥️ *Host:* \`${host}\`
+👤 *By:* \`${FIRST_NAME}\`
+💬 *Comment:* _${comment}_"
+            ((count++))
+            sleep 1 
+        done
+        log_msg "INFO" "ACK successfully applied: $host"
+    else
+        local error_detail=$(echo "$response" | grep -oP '(?<=<p>Error: ).*(?=</p>)' || echo "Rejected by CSRF or Permissions")
+        send_message "❌ *Error applying ACK to \`${host}\`.*
+Details: ${error_detail}"
+        log_msg "ERROR" "Failed to apply ACK: $host. Details: $error_detail"
+    fi
+}
+
+# ==========================================
+# 4. BOT CORE ROUTING & POLLING
+# ==========================================
+
+process_update() {
+    local text="$1"
+    
+    local command=$(echo "$text" | awk '{print tolower($1)}')
+    log_msg "INFO" "Received command: $command"
+
+    case "$command" in
+        /start|/help)
+            show_help
+            ;;
+        /broadcast)
+            local target_msg=$(echo "$text" | sed -e "s|^$command[[:space:]]*||")
+            if [[ -z "$target_msg" ]]; then
+                send_message "⚠️ *Invalid Format.*
+Usage: \`/broadcast The message you want to send to the team\`"
+            else
+                broadcast_message "$target_msg" "$FIRST_NAME"
+            fi
+            ;;
+        /hosts)
+            send_message "Querying hosts..."
+            get_hosts_down
+            ;;
+        /services)
+            send_message "Querying services..."
+            get_services_critical
+            ;;
+        /status)
+            get_system_status
+            ;;
+        /perf)
+            get_performance_data
+            ;;
+        /ack_host)
+            local target_host=$(echo "$text" | awk -F'"' '{print $2}')
+            local target_comment=$(echo "$text" | awk -F'"' '{print $3}' | xargs)
+            
+            if [[ -z "$target_host" ]]; then
+                send_message "⚠️ *Invalid Format.*
+Usage: \`/ack_host \"hostname\" Optional comment\`"
+            else
+                ack_host "$target_host" "$target_comment"
+            fi
+            ;;
+        /ack_service)
+            local target_host=$(echo "$text" | awk -F'"' '{print $2}')
+            local target_service=$(echo "$text" | awk -F'"' '{print $4}')
+            local target_comment=$(echo "$text" | awk -F'"' '{print $5}' | xargs)
+            
+            if [[ -z "$target_host" ]] || [[ -z "$target_service" ]]; then
+                send_message "⚠️ *Invalid Format.*
+Usage: \`/ack_service \"hostname\" \"service_name\" Optional comment\`"
+            else
+                ack_service "$target_host" "$target_service" "$target_comment"
+            fi
+            ;;
+        /ping)
+            send_message "🏓 Pong! The bot is fully operational."
+            ;;
+        /shutdown)
+            log_msg "WARN" "Remote shutdown triggered via Telegram by $FIRST_NAME ($CHAT_ID)."
+            send_message "⚙️ *Executing remote shutdown sequence...*"
+            shutdown_sequence
+            ;;
+        *)
+            log_msg "WARN" "Unknown command received: $command"
+            send_message "❓ *Command not recognized.*
+I did not understand the action \`$command\`.
+
+👉 Type /help to see the available commands."
+            ;;
+    esac
+}
+
+bot_main_loop() {
+    log_msg "INFO" "Starting main polling loop..."
+    
+    while true; do
+        # Use a slightly longer timeout for curl than the long-poll query parameter
+        local updates
+        if ! updates=$(${CURL_EXEC} -m 35 "${TELEGRAM_API}/getUpdates?offset=${OFFSET}&timeout=${LONG_POLL_TIMEOUT}"); then
+            log_msg "WARN" "Connection to Telegram API timed out or failed. Retrying..."
+            sleep 5
+            continue
+        fi
+        
+        local update_count=$(echo "$updates" | jq '.result | length' 2>/dev/null)
+        
+        # If jq fails or returns null/empty
+        if [[ -z "$update_count" ]]; then
+            log_msg "WARN" "Failed to parse Telegram API response."
+            sleep 2
+            continue
+        fi
+        
+        if [[ "$update_count" -gt 0 ]]; then
+            for (( i=0; i<$update_count; i++ )); do
+                local update_id=$(echo "$updates" | jq -r ".result[$i].update_id")
+                CHAT_ID=$(echo "$updates" | jq -r ".result[$i].message.chat.id")
+                FIRST_NAME=$(echo "$updates" | jq -r ".result[$i].message.chat.first_name")
+                local text=$(echo "$updates" | jq -r ".result[$i].message.text")
+
+                # Update offset safely
+                OFFSET=$((update_id + 1))
+                echo "$OFFSET" > "$OFFSET_FILE"
+
+                [[ "$text" == "null" || -z "$text" ]] && continue
+
+                if ! is_authorized "$CHAT_ID"; then
+                    log_msg "WARN" "Unauthorized access attempt from Chat ID: ${CHAT_ID} (${FIRST_NAME})"
+                    send_message "⛔ *Access Denied.*"
+                    continue
+                fi
+
+                # Route the command
+                process_update "$text"
+            done
+        fi
+        sleep 1
+    done
+}
+
+# ==========================================
+# GRACEFUL SHUTDOWN HANDLING
+# ==========================================
+
+shutdown_sequence() {
+    log_msg "INFO" "Termination signal received. Initiating graceful shutdown..."
+    
+    # 1. Forzar la confirmación del offset en la API de Telegram para evitar bucles de reinicio
+    if [[ -n "$OFFSET" && "$OFFSET" -gt 0 ]]; then
+        log_msg "INFO" "Flushing offset ($OFFSET) to Telegram API before exit..."
+        $CURL_EXEC "${TELEGRAM_API}/getUpdates?offset=${OFFSET}" >/dev/null 2>&1
+    fi
+    
+    # 2. Enviar mensaje de despedida a los administradores
+    local shutdown_msg="🛑 *System Alert:* The bot is shutting down and will be offline."
+    
+    IFS=',' read -ra ADM_CHATS <<< "$ALLOWED_CHAT_IDS"
+    for chat in "${ADM_CHATS[@]}"; do
+        if [[ -n "$chat" ]]; then
+            $CURL_EXEC -X POST "${TELEGRAM_API}/sendMessage" \
+                --data-urlencode "chat_id=${chat}" \
+                --data-urlencode "text=${shutdown_msg}" \
+                --data-urlencode "parse_mode=Markdown" >/dev/null 2>&1
+        fi
+    done
+    
+    log_msg "INFO" "Cleanup complete. Exiting cleanly (0)."
+    exit 0
+}
+
+# Trap SIGINT (Ctrl+C) and SIGTERM (systemctl stop) to run the shutdown_sequence
+trap shutdown_sequence SIGINT SIGTERM
+
+# ==========================================
+# 5. INITIALIZATION & SETUP
+# ==========================================
+
+# Default Config Path
+CONFIG_FILE="/etc/nagios-telegram-bot/config.env"
+OFFSET_FILE="/etc/nagios-telegram-bot/bot_offset.txt"
+
+# Argument Parsing
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -f|--config)  CONFIG_FILE="$2"; shift ;;
+        -V|--version) echo "nagios-telegram-bot v${VERSION}"; exit 0 ;;
+        *) 
+            echo "❌ Unknown parameter: $1"
+            echo "Usage: $0 [-f|--config /path/to/config.env] [-V|--version]"
+            exit 1 ;;
+    esac
+    shift
+done
+
+check_dependencies
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    log_msg "FATAL" "Configuration file not found: $CONFIG_FILE"
+    exit 1
+fi
+
+source "$CONFIG_FILE"
+
+TELEGRAM_API="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
+NAGIOS_URL="${NAGIOS_URL%/}"
+
+if [[ -f "$OFFSET_FILE" ]]; then
+    OFFSET=$(cat "$OFFSET_FILE")
+else
+    OFFSET=0
+fi
+
+log_msg "INFO" "Initializing Nagios Telegram Bot with persistence at $OFFSET_FILE..."
+
+# Startup Broadcast
+IFS=',' read -ra ADM_CHATS <<< "$ALLOWED_CHAT_IDS"
+for chat in "${ADM_CHATS[@]}"; do
+    if [[ -n "$chat" ]]; then
+        CHAT_ID="$chat"
+        FIRST_NAME="Admin"
+        send_message "🚀 *nagios-telegram-bot has been successfully started/restarted.*"
+        show_help
+    fi
+done
+
+# Clear globals
+CHAT_ID=""
+FIRST_NAME=""
+
+# Launch Long Polling
+bot_main_loop

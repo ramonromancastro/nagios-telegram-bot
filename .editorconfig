@@ -1,0 +1,13 @@
+# Indica que este es el archivo de configuración principal (no buscar en carpetas superiores)
+root = true
+
+# Aplicar a todos los archivos por defecto
+[*]
+charset = utf-8
+end_of_line = lf
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+# Para el Makefile, forzamos el uso de tabulaciones reales (vital para que funcione)
+[Makefile]
+indent_style = tab

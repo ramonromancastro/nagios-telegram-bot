@@ -1,0 +1,11 @@
+# Por defecto, normaliza los saltos de línea a LF (Linux) para todos los archivos de texto
+* text=auto eol=lf
+
+# Forzar explícitamente LF en scripts y configuraciones, pase lo que pase
+*.sh text eol=lf
+Makefile text eol=lf
+*.env.* text eol=lf
+
+# Excluir archivos binarios (si en el futuro subieras imágenes o ejecutables compilados)
+*.png binary
+*.jpg binary

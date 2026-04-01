@@ -1,0 +1,213 @@
+#!/bin/bash
+#
+# nagios-telegram-notify - Notificaciones Telegram para Nagios Core
+# Copyright (c) 2026 Ramón Román Castro <ramonroancastro@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -euo pipefail
+
+# --- Global Variables ---
+VERSION="1.1.0"
+CONFIG_FILE="/etc/nagios-telegram-bot/config.env"
+TELEGRAM_TOKEN=""
+CHAT_ID=""
+MSG_TYPE=""
+HOSTNAME=""
+STATE=""
+OUTPUT=""
+SERVICE_DESC=""
+VERBOSE=0
+
+# --- Functions ---
+log() {
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        echo "[INFO] $*"
+    fi
+}
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Options:
+  -c, --chat-id       Telegram Chat ID (Required)
+  -t, --type          Notification type: HOST or SERVICE (Required)
+  -H, --hostname      Host name (Required)
+  -s, --state         State (UP, DOWN, OK, CRITICAL, etc.) (Required)
+  -o, --output        Plugin output/information (Required)
+  -d, --description   Service description (Required if type is SERVICE)
+  -k, --token         Telegram Bot Token (Overrides config file)
+  -f, --config        Path to config.env (Default: /etc/nagios-telegram-bot/config.env)
+  -v, --verbose       Enable verbose logging
+  -V, --version       Show script version
+  -h, --help          Show this help message
+EOF
+    exit 1
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--chat-id)     CHAT_ID="$2"; shift 2 ;;
+            -t|--type)        MSG_TYPE="$2"; shift 2 ;;
+            -H|--hostname)    HOSTNAME="$2"; shift 2 ;;
+            -s|--state)       STATE="$2"; shift 2 ;;
+            -o|--output)      OUTPUT="$2"; shift 2 ;;
+            -d|--description) SERVICE_DESC="$2"; shift 2 ;;
+            -k|--token)       TELEGRAM_TOKEN="$2"; shift 2 ;;
+            -f|--config)      CONFIG_FILE="$2"; shift 2 ;;
+            -v|--verbose)     VERBOSE=1; shift 1 ;;
+            -V|--version)     echo "nagios_telegram_notify v${VERSION}"; exit 0 ;;
+            -h|--help)        usage ;;
+            *) echo "[ERROR] Unknown parameter: $1" >&2; usage ;;
+        esac
+    done
+}
+
+validate_params() {
+    log "Validating parameters..."
+
+    # Load token from config file if not provided via arguments
+    if [[ -z "$TELEGRAM_TOKEN" ]]; then
+        if [[ -f "$CONFIG_FILE" ]]; then
+            source "$CONFIG_FILE"
+            TELEGRAM_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+        fi
+    fi
+
+    if [[ -z "$TELEGRAM_TOKEN" ]]; then
+        echo "[ERROR] Telegram token is missing. Provide it via -k or -f." >&2
+        exit 1
+    fi
+    if [[ -z "$CHAT_ID" || -z "$MSG_TYPE" || -z "$HOSTNAME" || -z "$STATE" || -z "$OUTPUT" ]]; then
+        echo "[ERROR] Missing mandatory parameters." >&2
+        usage
+    fi
+
+    # Convert MSG_TYPE to uppercase for safety
+    MSG_TYPE="${MSG_TYPE^^}"
+
+    if [[ "$MSG_TYPE" == "SERVICE" && -z "$SERVICE_DESC" ]]; then
+        echo "[ERROR] Service description (-d) is required for SERVICE type notifications." >&2
+        exit 1
+    fi
+}
+
+format_message() {
+    local icon=""
+    local text=""
+    local notify=""
+    local state_upper="${STATE^^}"
+
+    if [[ "$MSG_TYPE" == "HOST" ]]; then
+        case "$state_upper" in
+            UP)   icon="✅"; notify="RECOVERY" ;;
+            DOWN) icon="🚨"; notify="PROBLEM" ;;
+            *)    icon="⚠️"; notify="PROBLEM" ;;
+        esac
+
+        text="${icon} *Nagios: Host ${notify}: ${HOSTNAME}*
+
+\*\*\*\*\* Nagios Core \*\*\*\*\*
+
+Notification Type: ${state_upper}
+
+🖥️ Host: \`${HOSTNAME}\`
+📊 State: \`${state_upper}\`
+
+💬 Additional Info:
+
+\`\`\`text
+${OUTPUT}
+\`\`\`"
+    else
+        case "$state_upper" in
+            OK)       icon="✅"; notify="RECOVERY" ;;
+            CRITICAL) icon="🚨"; notify="PROBLEM" ;;
+            *)        icon="⚠️"; notify="PROBLEM" ;;
+        esac
+
+        text="${icon} *Nagios: Service ${notify}: ${HOSTNAME}/${SERVICE_DESC} *
+
+\*\*\*\*\* Nagios Core \*\*\*\*\*
+
+Notification Type: ${state_upper}
+
+⚙️ Service: \`${SERVICE_DESC}\`
+🖥️ Host: \`${HOSTNAME}\`
+📊 State: \`${state_upper}\`
+
+💬 Additional Info:
+
+\`\`\`text
+${OUTPUT}
+\`\`\`"
+    fi
+
+    echo "$text"
+}
+
+send_telegram() {
+    local message="$1"
+    local url="https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage"
+    local response
+
+    # Safe curl execution with network error handling
+    if ! response=$(curl -s -X POST "$url" \
+        --data-urlencode "chat_id=${CHAT_ID}" \
+        --data-urlencode "text=${message}" \
+        --data-urlencode "parse_mode=Markdown"); then
+        
+        echo "[ERROR] Critical network failure. Could not connect to Telegram API." >&2
+        exit 1
+    fi
+
+    log "Parsing response from Telegram API..."
+    
+    # Validate response is valid JSON
+    if ! echo "$response" | jq -e . >/dev/null 2>&1; then
+        echo "[ERROR] Invalid JSON response from Telegram: $response" >&2
+        exit 1
+    fi
+
+    # Parse JSON and check if 'ok' is true
+    local ok
+    ok=$(echo "$response" | jq -r '.ok')
+
+    if [[ "$ok" != "true" ]]; then
+        local err_code desc
+        err_code=$(echo "$response" | jq -r '.error_code')
+        desc=$(echo "$response" | jq -r '.description')
+        echo "[ERROR] Telegram API failed (Error $err_code): $desc" >&2
+        exit 1
+    else
+        log "Message successfully delivered to Telegram."
+    fi
+}
+
+main() {
+    parse_args "$@"
+    log "Starting Nagios to Telegram notification script..."
+    validate_params
+
+    local formatted_msg
+    formatted_msg=$(format_message)
+
+    send_telegram "$formatted_msg"
+    log "Execution completed."
+}
+
+# Execute main function
+main "$@"
