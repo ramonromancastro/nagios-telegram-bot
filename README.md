@@ -6,6 +6,7 @@ This project empowers you to not only receive real-time Nagios alerts directly o
 
 ![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
 ![Bash](https://img.shields.io/badge/Language-Bash-green.svg)
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/ramonromancastro/nagios-telegram-bot/total)
 
 > **🤖 AI-Assisted Development:** This project was architected, refactored, and documented with the assistance of Artificial Intelligence. AI was leveraged to ensure strict adherence to Bash Best Practices (Strict Mode), robust error handling, and modern Linux packaging standards.
 

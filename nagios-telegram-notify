@@ -19,7 +19,7 @@
 set -euo pipefail
 
 # --- Global Variables ---
-VERSION="1.1.1"
+VERSION="1.1.2"
 CONFIG_FILE="/etc/nagios-telegram-bot/config.env"
 TELEGRAM_TOKEN=""
 CHAT_ID=""
