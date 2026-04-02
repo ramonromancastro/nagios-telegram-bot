@@ -16,6 +16,7 @@ ALLOWED_CHAT_IDS=""
 NAGIOS_URL=""
 NAGIOS_USER=""
 NAGIOS_PASS=""
+NAGIOS_GROUP="nagios"
 DAEMON_USER="nagios-telegram-bot"
 
 # --- Help Menu ---
@@ -37,7 +38,7 @@ Configuration options:
   --nagios-user=USER      Nagios API Username
   --nagios-pass=PASS      Nagios API Password
   --daemon-user=USER      System user to run the service [$DAEMON_USER]
-  
+  --nagios-group=GROUP    Nagios group [$NAGIOS_GROUP]
   --help                  Display this help and exit
 EOF
     exit 0
@@ -51,10 +52,12 @@ for arg in "$@"; do
         --sysconfdir=*) SYSCONFDIR="${arg#*=}" ;;
         --systemddir=*) SYSTEMDDIR="${arg#*=}" ;;
         --nagiosdir=*) NAGIOSDIR="${arg#*=}" ;;
+        --nagios-group=*) NAGIOS_GROUP="${arg#*=}" ;;
         --bot-token=*) TELEGRAM_BOT_TOKEN="${arg#*=}" ;;
         --chat-ids=*) ALLOWED_CHAT_IDS="${arg#*=}" ;;
         --nagios-url=*) NAGIOS_URL="${arg#*=}" ;;
         --nagios-user=*) NAGIOS_USER="${arg#*=}" ;;
+        --nagios-pass=*) NAGIOS_PASS="${arg#*=}" ;;
         --daemon-user=*) DAEMON_USER="${arg#*=}" ;;
         --help) usage ;;
         *) echo "[ERROR] Unknown option: $arg" >&2; exit 1 ;;
@@ -78,6 +81,7 @@ echo "[INFO] Gathering configuration data..."
 [[ -z "$NAGIOS_URL" ]] && read -p "Nagios URL (e.g., https://nagios.domain.com/nagios/): " NAGIOS_URL
 [[ -z "$NAGIOS_USER" ]] && read -p "Nagios API Username: " NAGIOS_USER
 [[ -z "$NAGIOS_PASS" ]] && read -s -p "Nagios API Password: " NAGIOS_PASS
+[[ -z "$NAGIOS_GROUP" ]] && read -p "Nagios Group: " NAGIOS_GROUP
 [[ -z "$DAEMON_USER" ]] && read -s -p "System user: " DAEMON_USER
 echo -e "\n"
 
@@ -121,6 +125,7 @@ SYSCONFDIR=${SYSCONFDIR}
 SYSTEMDDIR=${SYSTEMDDIR}
 NAGIOSDIR=${NAGIOSDIR}
 DAEMON_USER=${DAEMON_USER}
+NAGIOS_GROUP=${NAGIOS_GROUP}
 EOF
 
 echo "[OK] Configuration complete."

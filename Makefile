@@ -41,8 +41,8 @@ install-command:
 
 install-config: install-user build/config.env.build
 	@echo "[INFO] Installing configuration file to $(SYSCONFDIR)..."
-	install -d -m 755 -o $(DAEMON_USER) $(SYSCONFDIR)
-	install -m 600 -o $(DAEMON_USER) build/config.env.build $(SYSCONFDIR)/config.env
+	install -d -m 755 -o $(DAEMON_USER) -g $(NAGIOS_GROUP) $(SYSCONFDIR)
+	install -m 640 -o $(DAEMON_USER) -g $(NAGIOS_GROUP) build/config.env.build $(SYSCONFDIR)/config.env
 	@echo "[INFO] Ensuring correct ownership for offset file if it exists..."
 	@touch $(SYSCONFDIR)/bot_offset.txt
 	@chown $(DAEMON_USER) $(SYSCONFDIR)/bot_offset.txt
