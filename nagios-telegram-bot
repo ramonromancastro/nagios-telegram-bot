@@ -246,7 +246,7 @@ get_services_critical() {
     log_msg "INFO" "Querying unacknowledged critical services..."
     local hosts_response services_response unacked_down_hosts raw_data
     
-    if ! hosts_response=$(${CURL_EXEC} -u "${NAGIOS_USER}:${NAGIOS_PASS}" "${NAGIOS_URL}/cgi-bin/statusjson.cgi?query=hostlist&details=true&hoststatus=down%20unreachable%20pending"); then
+    if ! hosts_response=$(${CURL_EXEC} -u "${NAGIOS_USER}:${NAGIOS_PASS}" "${NAGIOS_URL}/cgi-bin/statusjson.cgi?query=hostlist&details=true"); then
         send_message "❌ *Error:* Unable to reach Nagios API."
         return 1
     fi
@@ -258,7 +258,7 @@ get_services_critical() {
     
     raw_data=$(echo "$services_response" | jq -r --argjson bad_hosts "$unacked_down_hosts" '
         .data.servicelist | to_entries[]? |
-        .key as $host | select($bad_hosts | index($host) | not) |
+        .key as $host | select($bad_hosts | index($host)) |
         .value | to_entries[]? | select(.value.problem_has_been_acknowledged == false) |
         "\($host)\t\(.key)\t\(.value.plugin_output)" 
     ' 2>/dev/null)
