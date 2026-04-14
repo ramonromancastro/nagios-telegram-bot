@@ -26,6 +26,18 @@ Ensure the server hosting your Nagios Core instance has the following basic pack
 * `jq` (for JSON parsing)
 * `awk` (for text and command processing)
 
+### 🤖 Telegram Bot Setup
+
+You will need a Telegram Bot to send notifications. If you haven't created one yet:
+
+**Create the Bot:** Message [@BotFather](https://t.me/botfather) on Telegram and follow the steps to create a new bot and obtain your **API Token**.
+
+> 💡 **Tip:** You can message [@userinfobot](https://t.me/userinfobot) to quickly retrieve your personal Chat ID.
+
+**Get your Chat ID:** You need the ID of the chat or group where the notifications will be sent.
+
+Documentation: For a detailed step-by-step guide, refer to the official [From BotFather to 'Hello World' tutorial](https://core.telegram.org/bots/tutorial).
+
 ## 🛠️ Project Components
 
 This ecosystem consists of two main tools that can work together or independently:
