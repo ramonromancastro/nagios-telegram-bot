@@ -36,7 +36,7 @@ You will need a Telegram Bot to send notifications. If you haven't created one y
 
 **Get your Chat ID:** You need the ID of the chat or group where the notifications will be sent.
 
-Documentation: For a detailed step-by-step guide, refer to the official [From BotFather to 'Hello World' tutorial](https://core.telegram.org/bots/tutorial).
+**Documentation:** For a detailed step-by-step guide, refer to the official [From BotFather to 'Hello World' tutorial](https://core.telegram.org/bots/tutorial).
 
 ## 🛠️ Project Components
 
